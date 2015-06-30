@@ -29,7 +29,10 @@ func init() {
 }
 
 type Schedule struct {
-	sync.Mutex
+	mutex         sync.Mutex
+	mutexHolder   string
+	mutexAquired  time.Time
+	mutexWaitTime time.Duration
 
 	Conf          *conf.Conf
 	status        States
@@ -49,10 +52,29 @@ type Schedule struct {
 	db            *bolt.DB
 }
 
-func (s *Schedule) TimeLock(t miniprofiler.Timer) {
-	t.Step("lock", func(t miniprofiler.Timer) {
-		s.Lock()
-	})
+func init() {
+	metadata.AddMetricMeta(
+		"bosun.schedule.lock.wait", metadata.Counter, metadata.MilliSecond,
+		"The length of time spent waiting for the schedule lock.")
+	metadata.AddMetricMeta(
+		"bosun.schedule.lock.held", metadata.Counter, metadata.MilliSecond,
+		"The length of time spent while holding the schedule lock.")
+}
+
+func (s *Schedule) Lock(method string) {
+	start := time.Now()
+	s.mutex.Lock()
+	s.mutexAquired = time.Now()
+	s.mutexWaitTime = s.mutexAquired.Sub(start) / time.Millisecond // remember this so we don't have to call put until we leave the critical section.
+}
+
+func (s *Schedule) Unlock() {
+	holder := s.mutexHolder
+	start := s.mutexAquired
+	waitTime := s.mutexWaitTime
+	s.mutex.Unlock()
+	collect.Put("bosun.schedule.lock.wait", opentsdb.TagSet{"caller": holder}, waitTime)
+	collect.Put("bosun.schedule.lock.held", opentsdb.TagSet{"caller": holder}, time.Now().Sub(start)/time.Millisecond)
 }
 
 type Metavalue struct {
@@ -259,11 +281,16 @@ type StateGroups struct {
 }
 
 func (s *Schedule) MarshalGroups(T miniprofiler.Timer, filter string) (*StateGroups, error) {
-	silenced := s.Silenced()
+	var silenced map[expr.AlertKey]Silence
+	T.Step("Silenced", func(miniprofiler.Timer) {
+		silenced = s.Silenced()
+	})
 	t := StateGroups{
 		TimeAndDate: s.Conf.TimeAndDate,
 	}
-	s.TimeLock(T)
+	T.Step("lock", func(t miniprofiler.Timer) {
+		s.Lock("MarshalGroups")
+	})
 	defer s.Unlock()
 	status := make(States)
 	matches, err := makeFilter(filter)
@@ -553,7 +580,7 @@ func (s *State) Action(user, message string, t ActionType, timestamp time.Time) 
 }
 
 func (s *Schedule) Action(user, message string, t ActionType, ak expr.AlertKey) error {
-	s.Lock()
+	s.Lock("Action")
 	defer func() {
 		s.Unlock()
 		s.Save()
